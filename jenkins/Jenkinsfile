@@ -1,0 +1,84 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION     = 'ap-south-1'
+        ECR_REPO       = 'demo-app'
+        ECR_REGISTRY   = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        IMAGE_TAG      = "${env.BUILD_NUMBER}"
+        ECS_CLUSTER    = 'demo-cluster'
+        ECS_SERVICE    = 'demo-app-service'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Install & Test') {
+            steps {
+                dir('app') {
+                    sh '''
+                        python3 -m venv venv
+                        . venv/bin/activate
+                        pip install -r requirements.txt
+                        pytest test_app.py -v
+                    '''
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                dir('app') {
+                    sh "docker build -t ${ECR_REPO}:${IMAGE_TAG} ."
+                }
+            }
+        }
+
+        // Trivy scan before pushing — catching a critical CVE here is far cheaper
+        // than catching it after the image is already running in production.
+        stage('Security Scan') {
+            steps {
+                sh "trivy image --exit-code 1 --severity CRITICAL ${ECR_REPO}:${IMAGE_TAG}"
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                sh '''
+                    aws ecr get-login-password --region ${AWS_REGION} | \
+                        docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                    docker tag ${ECR_REPO}:${IMAGE_TAG} ${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG}
+                    docker push ${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG}
+                '''
+            }
+        }
+
+        // Forcing a new deployment tells ECS to pull the new image and perform
+        // a rolling replacement of tasks — this is what gives zero-downtime releases.
+        stage('Deploy to ECS') {
+            steps {
+                sh '''
+                    aws ecs update-service \
+                        --cluster ${ECS_CLUSTER} \
+                        --service ${ECS_SERVICE} \
+                        --force-new-deployment \
+                        --region ${AWS_REGION}
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Deployment of build #${env.BUILD_NUMBER} succeeded."
+        }
+        failure {
+            echo "Pipeline failed — check the stage logs above. ECS service was not updated."
+        }
+    }
+}
