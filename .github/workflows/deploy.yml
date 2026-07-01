@@ -12,6 +12,7 @@ env:
 
 jobs:
   test:
+    name: Run Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,17 +22,17 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
-        run: pip install -r app/requirements.txt
+      - name: Install dependencies and run tests
+        run: |
+          pip install -r app/requirements.txt
+          pytest app/test_app.py -v
 
-      - name: Run tests
-        run: pytest app/test_app.py -v
-
-  build-and-deploy:
+  build:
+    name: Build & Scan Docker Image
     needs: test
     runs-on: ubuntu-latest
-    # Only runs on real push to main — PRs only trigger the test job above
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    outputs:
+      image_uri: ${{ steps.build.outputs.image_uri }}
     steps:
       - uses: actions/checkout@v4
 
@@ -46,23 +47,46 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push image to ECR
+      - name: Build Docker image
+        id: build
         env:
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
           docker build -t $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG ./app
+          echo "image_uri=$ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-          # --ignore-unfixed skips CVEs where no patch exists yet (e.g. perl-base
-          # upstream deferred CVEs). We still catch anything that HAS a fix available.
-          docker run --rm aquasec/trivy image \
-            --exit-code 1 \
-            --severity CRITICAL \
-            --ignore-unfixed \
-            $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG
+      # Use the official Trivy Action — it scans the locally built image directly
+      # without needing a Docker socket or separate container. --ignore-unfixed
+      # skips CVEs with no available patch (e.g. perl-base upstream deferrals).
+      - name: Trivy security scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.build.outputs.image_uri }}
+          format: table
+          exit-code: '1'
+          severity: CRITICAL
+          ignore-unfixed: true
 
-          docker push $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG
-          echo "IMAGE_URI=$ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG" >> $GITHUB_ENV
+      - name: Push image to ECR
+        env:
+          IMAGE_URI: ${{ steps.build.outputs.image_uri }}
+        run: docker push $IMAGE_URI
+
+  deploy:
+    name: Deploy to ECS
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Download current ECS task definition
         run: |
@@ -77,9 +101,9 @@ jobs:
         with:
           task-definition: task-definition.json
           container-name: demo-app
-          image: ${{ env.IMAGE_URI }}
+          image: ${{ needs.build.outputs.image_uri }}
 
-      - name: Deploy updated task definition to ECS
+      - name: Deploy to ECS and wait for stability
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
           task-definition: ${{ steps.update-task-def.outputs.task-definition }}

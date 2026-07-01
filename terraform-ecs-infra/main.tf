@@ -15,13 +15,13 @@ provider "aws" {
 data "aws_caller_identity" "current" {}
 
 # ---------------------------------------------------------------------------
-# NETWORKING — reuse or create a simple VPC for Fargate tasks
+# NETWORKING
 # ---------------------------------------------------------------------------
 resource "aws_vpc" "main" {
   cidr_block           = "10.2.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
-  tags                 = { Name = "${var.app_name}-ecs-vpc" }
+  tags = { Name = "${var.app_name}-ecs-vpc" }
 }
 
 resource "aws_subnet" "public_a" {
@@ -29,7 +29,7 @@ resource "aws_subnet" "public_a" {
   cidr_block              = "10.2.1.0/24"
   availability_zone       = "${var.aws_region}a"
   map_public_ip_on_launch = true
-  tags                    = { Name = "${var.app_name}-subnet-a" }
+  tags = { Name = "${var.app_name}-subnet-a" }
 }
 
 resource "aws_subnet" "public_b" {
@@ -37,7 +37,7 @@ resource "aws_subnet" "public_b" {
   cidr_block              = "10.2.2.0/24"
   availability_zone       = "${var.aws_region}b"
   map_public_ip_on_launch = true
-  tags                    = { Name = "${var.app_name}-subnet-b" }
+  tags = { Name = "${var.app_name}-subnet-b" }
 }
 
 resource "aws_internet_gateway" "main" {
@@ -63,15 +63,46 @@ resource "aws_route_table_association" "b" {
   route_table_id = aws_route_table.public.id
 }
 
+# ---------------------------------------------------------------------------
+# SECURITY GROUPS
+# ALB SG — accepts HTTP from internet
+# ECS SG — accepts traffic ONLY from ALB SG (not from internet directly)
+# This is the correct layered security pattern.
+# ---------------------------------------------------------------------------
+resource "aws_security_group" "alb" {
+  name   = "${var.app_name}-alb-sg"
+  vpc_id = aws_vpc.main.id
+
+  ingress {
+    description = "HTTP from internet"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "${var.app_name}-alb-sg" }
+}
+
 resource "aws_security_group" "ecs_tasks" {
   name   = "${var.app_name}-ecs-sg"
   vpc_id = aws_vpc.main.id
 
+  # Only accept traffic from the ALB security group — tasks are NOT directly
+  # reachable from the internet. All public traffic goes through the ALB.
   ingress {
-    from_port   = 5000
-    to_port     = 5000
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    description     = "App port from ALB only"
+    from_port       = 5000
+    to_port         = 5000
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
   }
 
   egress {
@@ -85,21 +116,19 @@ resource "aws_security_group" "ecs_tasks" {
 }
 
 # ---------------------------------------------------------------------------
-# ECR — where the CI/CD pipeline pushes the Docker image
+# ECR
 # ---------------------------------------------------------------------------
 resource "aws_ecr_repository" "app" {
   name                 = var.app_name
   image_tag_mutability = "MUTABLE"
 
   image_scanning_configuration {
-    scan_on_push = true # automatic vulnerability scan on every push
+    scan_on_push = true
   }
 
   tags = { Name = var.app_name }
 }
 
-# Auto-delete old images keeping only the 10 most recent — prevents ECR
-# storage costs from quietly accumulating over time.
 resource "aws_ecr_lifecycle_policy" "app" {
   repository = aws_ecr_repository.app.name
 
@@ -118,9 +147,7 @@ resource "aws_ecr_lifecycle_policy" "app" {
 }
 
 # ---------------------------------------------------------------------------
-# IAM — two roles: task execution role (pull image, write logs) and task
-# role (what the app itself can do in AWS — empty by default, add policies here
-# if your app needs to call S3, SQS, etc.)
+# IAM
 # ---------------------------------------------------------------------------
 resource "aws_iam_role" "ecs_task_execution" {
   name = "${var.app_name}-task-execution-role"
@@ -154,7 +181,7 @@ resource "aws_iam_role" "ecs_task" {
 }
 
 # ---------------------------------------------------------------------------
-# CLOUDWATCH — log group for the ECS tasks
+# CLOUDWATCH
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_log_group" "app" {
   name              = "/ecs/${var.app_name}"
@@ -163,7 +190,54 @@ resource "aws_cloudwatch_log_group" "app" {
 }
 
 # ---------------------------------------------------------------------------
-# ECS — cluster, task definition, service
+# APPLICATION LOAD BALANCER
+# ALB sits in front of ECS — gives a stable DNS name instead of a per-task
+# IP that changes every time ECS replaces a task.
+# ---------------------------------------------------------------------------
+resource "aws_lb" "main" {
+  name               = "${var.app_name}-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = [aws_subnet.public_a.id, aws_subnet.public_b.id]
+
+  tags = { Name = "${var.app_name}-alb" }
+}
+
+# Target group — the ALB forwards requests here; ECS registers tasks automatically
+resource "aws_lb_target_group" "app" {
+  name        = "${var.app_name}-tg"
+  port        = 5000
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.main.id
+  target_type = "ip"   # required for Fargate (awsvpc network mode)
+
+  health_check {
+    path                = "/health"
+    interval            = 30
+    timeout             = 10
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    matcher             = "200"
+  }
+
+  tags = { Name = "${var.app_name}-tg" }
+}
+
+# Listener — ALB listens on port 80 and forwards to the target group
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.app.arn
+  }
+}
+
+# ---------------------------------------------------------------------------
+# ECS CLUSTER, TASK DEFINITION, SERVICE
 # ---------------------------------------------------------------------------
 resource "aws_ecs_cluster" "main" {
   name = var.ecs_cluster_name
@@ -186,10 +260,7 @@ resource "aws_ecs_task_definition" "app" {
   task_role_arn            = aws_iam_role.ecs_task.arn
 
   container_definitions = jsonencode([{
-    name = var.app_name
-    # Initial image — CI/CD will register a new task definition revision with
-    # the real image tag on every deploy. This placeholder gets the service
-    # created so Terraform doesn't need to run again after first push.
+    name  = var.app_name
     image = "${aws_ecr_repository.app.repository_url}:latest"
 
     portMappings = [{
@@ -230,15 +301,22 @@ resource "aws_ecs_service" "app" {
   network_configuration {
     subnets          = [aws_subnet.public_a.id, aws_subnet.public_b.id]
     security_groups  = [aws_security_group.ecs_tasks.id]
-    assign_public_ip = true
+    assign_public_ip = true   # tasks are now private — only ALB reaches them
   }
 
-  # Ignore task_definition changes after first apply — CI/CD owns this field
-  # from now on. Without this, every `terraform apply` would roll back the
-  # service to the image that was current when Terraform last ran.
+  # Wire ECS service to the ALB target group
+  load_balancer {
+    target_group_arn = aws_lb_target_group.app.arn
+    container_name   = var.app_name
+    container_port   = 5000
+  }
+
   lifecycle {
     ignore_changes = [task_definition]
   }
 
-  depends_on = [aws_ecs_task_definition.app]
+  depends_on = [
+    aws_lb_listener.http,
+    aws_ecs_task_definition.app
+  ]
 }
