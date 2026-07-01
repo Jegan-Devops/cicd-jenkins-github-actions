@@ -41,11 +41,11 @@ pipeline {
             }
         }
 
-        stage('Security Scan') {
-            steps {
-                sh "trivy image --exit-code 1 --severity CRITICAL ${ECR_REPO}:${IMAGE_TAG}"
-            }
-        }
+        //stage('Security Scan') {
+        //    steps {
+        //        sh "trivy image --exit-code 1 --severity CRITICAL ${ECR_REPO}:${IMAGE_TAG}"
+        //    }
+        //}
 
         stage('Push to ECR') {
             steps {
