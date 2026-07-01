@@ -8,6 +8,8 @@ pipeline {
         IMAGE_TAG      = "${env.BUILD_NUMBER}"
         ECS_CLUSTER    = 'demo-cluster'
         ECS_SERVICE    = 'demo-app-service'
+        TASK_FAMILY    = 'demo-app-service'
+        CONTAINER_NAME = 'demo-app'
     }
 
     stages {
@@ -39,8 +41,6 @@ pipeline {
             }
         }
 
-        // Trivy scan before pushing — catching a critical CVE here is far cheaper
-        // than catching it after the image is already running in production.
         stage('Security Scan') {
             steps {
                 sh "trivy image --exit-code 1 --severity CRITICAL ${ECR_REPO}:${IMAGE_TAG}"
@@ -58,15 +58,38 @@ pipeline {
             }
         }
 
-        // Forcing a new deployment tells ECS to pull the new image and perform
-        // a rolling replacement of tasks — this is what gives zero-downtime releases.
+        // Pull the CURRENT task definition, swap only the image, register the new
+        // revision, then update the service to use it. This is the correct pattern —
+        // update-service alone doesn't change which image is running.
         stage('Deploy to ECS') {
             steps {
                 sh '''
+                    TASK_DEF=$(aws ecs describe-task-definition \
+                        --task-definition ${TASK_FAMILY} \
+                        --region ${AWS_REGION} \
+                        --query "taskDefinition" --output json)
+
+                    NEW_TASK_DEF=$(echo $TASK_DEF | python3 -c "
+import sys, json
+td = json.load(sys.stdin)
+for c in td['containerDefinitions']:
+    if c['name'] == '${CONTAINER_NAME}':
+        c['image'] = '${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG}'
+for key in ['taskDefinitionArn','revision','status','requiresAttributes',
+            'compatibilities','registeredAt','registeredBy']:
+    td.pop(key, None)
+print(json.dumps(td))
+")
+
+                    NEW_TASK_ARN=$(aws ecs register-task-definition \
+                        --region ${AWS_REGION} \
+                        --cli-input-json "$NEW_TASK_DEF" \
+                        --query "taskDefinition.taskDefinitionArn" --output text)
+
                     aws ecs update-service \
                         --cluster ${ECS_CLUSTER} \
                         --service ${ECS_SERVICE} \
-                        --force-new-deployment \
+                        --task-definition $NEW_TASK_ARN \
                         --region ${AWS_REGION}
                 '''
             }
@@ -75,10 +98,10 @@ pipeline {
 
     post {
         success {
-            echo "Deployment of build #${env.BUILD_NUMBER} succeeded."
+            echo "Build #${env.BUILD_NUMBER} deployed successfully."
         }
         failure {
-            echo "Pipeline failed — check the stage logs above. ECS service was not updated."
+            echo "Pipeline failed at the stage above. ECS was not updated."
         }
     }
 }

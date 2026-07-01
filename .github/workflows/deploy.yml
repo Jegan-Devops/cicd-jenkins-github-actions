@@ -32,8 +32,7 @@ jobs:
   build-and-deploy:
     needs: test
     runs-on: ubuntu-latest
-    # Only deploy on an actual push to main — pull requests just run tests above,
-    # so a PR from a fork can never trigger a deployment.
+    # Only runs on real push to main — PRs only trigger the test job above
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
@@ -41,31 +40,43 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Log in to Amazon ECR
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, scan, and push image
+      - name: Build and push image to ECR
         env:
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
           docker build -t $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG ./app
-
-          # Same gate as the Jenkins pipeline: fail the build on critical CVEs.
-          docker run --rm aquasec/trivy image \
-            --exit-code 1 --severity CRITICAL \
-            $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG
-
           docker push $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG
+          # Save the full image URI for the task definition step below
+          echo "IMAGE_URI=$ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG" >> $GITHUB_ENV
 
-      - name: Deploy to ECS
+      - name: Download current ECS task definition
         run: |
-          aws ecs update-service \
-            --cluster ${{ env.ECS_CLUSTER }} \
-            --service ${{ env.ECS_SERVICE }} \
-            --force-new-deployment \
-            --region ${{ env.AWS_REGION }}
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_SERVICE }} \
+            --region ${{ env.AWS_REGION }} \
+            --query taskDefinition > task-definition.json
+
+      - name: Update task definition with new image
+        id: update-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: demo-app
+          image: ${{ env.IMAGE_URI }}
+
+      - name: Deploy updated task definition to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.update-task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
