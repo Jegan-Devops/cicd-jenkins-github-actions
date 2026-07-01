@@ -3,14 +3,18 @@ pipeline {
 
     environment {
         AWS_REGION     = 'ap-south-1'
-	AWS_ACCOUNT_ID = credentials('AWS_ACCOUNT_ID')
         ECR_REPO       = 'demo-app'
-        ECR_REGISTRY   = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-        IMAGE_TAG      = "${env.BUILD_NUMBER}"
         ECS_CLUSTER    = 'demo-cluster'
         ECS_SERVICE    = 'demo-app-service'
         TASK_FAMILY    = 'demo-app-service'
         CONTAINER_NAME = 'demo-app'
+        IMAGE_TAG      = "${env.BUILD_NUMBER}"
+
+        // AWS_ACCOUNT_ID is stored as a Jenkins Secret Text credential —
+        // never hardcoded. Add it in Jenkins → Manage Jenkins → Credentials
+        // → Global → Add Credential → Secret text → ID: AWS_ACCOUNT_ID
+        AWS_ACCOUNT_ID = credentials('AWS_ACCOUNT_ID')
+        ECR_REGISTRY   = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
     }
 
     stages {
@@ -42,11 +46,22 @@ pipeline {
             }
         }
 
-        //stage('Security Scan') {
-        //    steps {
-        //        sh "trivy image --exit-code 1 --severity CRITICAL ${ECR_REPO}:${IMAGE_TAG}"
-        //    }
-        //}
+        // Trivy scans for vulnerabilities BEFORE pushing to ECR.
+        // We gate only on CRITICAL severity with an available fix (fix_deferred
+        // and affected statuses are excluded). This avoids failing builds on
+        // CVEs like perl-base where upstream has no patch yet — a common real
+        // production tuning decision.
+        stage('Security Scan (Trivy)') {
+            steps {
+                sh """
+                    trivy image \
+                        --exit-code 1 \
+                        --severity CRITICAL \
+                        --ignore-unfixed \
+                        ${ECR_REPO}:${IMAGE_TAG}
+                """
+            }
+        }
 
         stage('Push to ECR') {
             steps {
@@ -59,9 +74,12 @@ pipeline {
             }
         }
 
-        // Pull the CURRENT task definition, swap only the image, register the new
-        // revision, then update the service to use it. This is the correct pattern —
-        // update-service alone doesn't change which image is running.
+        // Correct ECS deploy pattern:
+        // 1. Pull current task definition
+        // 2. Swap only the image field
+        // 3. Register new task definition revision
+        // 4. Update service to point at new revision
+        // update-service alone does NOT change the running image.
         stage('Deploy to ECS') {
             steps {
                 sh '''
@@ -92,6 +110,8 @@ print(json.dumps(td))
                         --service ${ECS_SERVICE} \
                         --task-definition $NEW_TASK_ARN \
                         --region ${AWS_REGION}
+
+                    echo "Deployed task definition: $NEW_TASK_ARN"
                 '''
             }
         }
@@ -99,10 +119,14 @@ print(json.dumps(td))
 
     post {
         success {
-            echo "Build #${env.BUILD_NUMBER} deployed successfully."
+            echo "✅ Build #${env.BUILD_NUMBER} deployed successfully to ECS."
         }
         failure {
-            echo "Pipeline failed at the stage above. ECS was not updated."
+            echo "❌ Build #${env.BUILD_NUMBER} failed. ECS was NOT updated."
+        }
+        always {
+            // Clean up local Docker images to avoid disk filling up on the Jenkins server
+            sh "docker rmi ${ECR_REPO}:${IMAGE_TAG} || true"
         }
     }
 }

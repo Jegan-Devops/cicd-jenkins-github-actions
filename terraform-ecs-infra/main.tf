@@ -21,7 +21,7 @@ resource "aws_vpc" "main" {
   cidr_block           = "10.2.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
-  tags                 = { Name = "${var.app_name}-ecs-vpc" }
+  tags = { Name = "${var.app_name}-ecs-vpc" }
 }
 
 resource "aws_subnet" "public_a" {
@@ -29,7 +29,7 @@ resource "aws_subnet" "public_a" {
   cidr_block              = "10.2.1.0/24"
   availability_zone       = "${var.aws_region}a"
   map_public_ip_on_launch = true
-  tags                    = { Name = "${var.app_name}-subnet-a" }
+  tags = { Name = "${var.app_name}-subnet-a" }
 }
 
 resource "aws_subnet" "public_b" {
@@ -37,7 +37,7 @@ resource "aws_subnet" "public_b" {
   cidr_block              = "10.2.2.0/24"
   availability_zone       = "${var.aws_region}b"
   map_public_ip_on_launch = true
-  tags                    = { Name = "${var.app_name}-subnet-b" }
+  tags = { Name = "${var.app_name}-subnet-b" }
 }
 
 resource "aws_internet_gateway" "main" {
@@ -92,7 +92,7 @@ resource "aws_ecr_repository" "app" {
   image_tag_mutability = "MUTABLE"
 
   image_scanning_configuration {
-    scan_on_push = true # automatic vulnerability scan on every push
+    scan_on_push = true   # automatic vulnerability scan on every push
   }
 
   tags = { Name = var.app_name }
@@ -186,7 +186,7 @@ resource "aws_ecs_task_definition" "app" {
   task_role_arn            = aws_iam_role.ecs_task.arn
 
   container_definitions = jsonencode([{
-    name = var.app_name
+    name  = var.app_name
     # Initial image — CI/CD will register a new task definition revision with
     # the real image tag on every deploy. This placeholder gets the service
     # created so Terraform doesn't need to run again after first push.
@@ -202,9 +202,9 @@ resource "aws_ecs_task_definition" "app" {
     healthCheck = {
       command     = ["CMD-SHELL", "curl -f http://localhost:5000/health || exit 1"]
       interval    = 30
-      timeout     = 5
-      retries     = 3
-      startPeriod = 10
+      timeout     = 10
+      retries     = 5
+      startPeriod = 30
     }
 
     logConfiguration = {

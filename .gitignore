@@ -3,16 +3,3 @@ __pycache__/
 venv/
 .env
 *.log
-*.tfstate
-*.tfstate.backup
-.terraform/
-.terraform.lock.hcl
-terraform.tfvars
-*.pem
-*/*.tfstate
-*/*.tfstate.backup
-*/.terraform/
-*/.terraform.lock.hcl
-*/terraform.tfvars
-*/*.pem
-

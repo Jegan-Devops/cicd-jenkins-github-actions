@@ -3,8 +3,7 @@ name: CI/CD Pipeline
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+
 env:
   AWS_REGION: ap-south-1
   ECR_REPO: demo-app
@@ -53,8 +52,16 @@ jobs:
           IMAGE_TAG: ${{ github.sha }}
         run: |
           docker build -t $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG ./app
+
+          # --ignore-unfixed skips CVEs where no patch exists yet (e.g. perl-base
+          # upstream deferred CVEs). We still catch anything that HAS a fix available.
+          docker run --rm aquasec/trivy image \
+            --exit-code 1 \
+            --severity CRITICAL \
+            --ignore-unfixed \
+            $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG
+
           docker push $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG
-          # Save the full image URI for the task definition step below
           echo "IMAGE_URI=$ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG" >> $GITHUB_ENV
 
       - name: Download current ECS task definition
