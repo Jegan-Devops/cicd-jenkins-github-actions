@@ -3,6 +3,7 @@ pipeline {
 
     environment {
         AWS_REGION     = 'ap-south-1'
+	AWS_ACCOUNT_ID = credentials('AWS_ACCOUNT_ID')
         ECR_REPO       = 'demo-app'
         ECR_REGISTRY   = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
         IMAGE_TAG      = "${env.BUILD_NUMBER}"
